@@ -1,0 +1,12 @@
+# Runtime dependencies. Install with:  pip install -r requirements.txt
+# Or install the package (editable) with the CLI entry point:  pip install -e .
+
+pypdf>=5.1.0          # core read/write, merge, encrypt, forms, metadata
+pdfplumber>=0.11.0    # layout-aware text and table extraction
+Pillow>=10.0.0        # image handling for images_to_pdf and rasterization
+pypdfium2>=4.20.0     # fast page rendering (pdf_to_images, compress, ocr)
+reportlab>=4.0.0      # overlays: watermarks, page numbers, test fixtures
+pytesseract>=0.3.10   # OCR wrapper (needs the Tesseract binary installed too)
+
+# Dev/test only (or: pip install -e ".[dev]")
+pytest>=8.0.0

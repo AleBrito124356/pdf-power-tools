@@ -1,0 +1,36 @@
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Packaging / test caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Generated output (the CLI writes here; none of it is source)
+out/
+results/
+logs/
+*_parts/
+*_pages/
+*_images/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
