@@ -14,7 +14,7 @@ with a message meant for a person.
 
 from __future__ import annotations
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from ._util import PdfToolsError, PdfToolsWarning
 from .ops_pages import (
