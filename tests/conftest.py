@@ -162,6 +162,142 @@ def _make_encrypted_pdf(src_path: str, path: str, user_pw: str, owner_pw: str) -
     return path
 
 
+def _make_photo_pdf(path: str, pages: int = 2, size=(1600, 1200)) -> str:
+    """Pages with a text line and a big, losslessly embedded noisy 'photo'."""
+    from PIL import Image, ImageFilter
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+
+    c = canvas.Canvas(path, pagesize=letter)
+    for p in range(pages):
+        noise = Image.effect_noise(size, 60 + 10 * p).filter(ImageFilter.GaussianBlur(1.5))
+        photo = Image.merge("RGB", (noise, noise.rotate(90, expand=False), noise.transpose(Image.FLIP_LEFT_RIGHT)))
+        buf = io.BytesIO()
+        photo.save(buf, format="PNG")
+        buf.seek(0)
+        c.setFont("Helvetica", 14)
+        c.drawString(72, 740, f"Site survey photo {p + 1} - keep this text selectable")
+        # 1600 px shown 468 pt (6.5 in) wide = ~246 dpi.
+        c.drawImage(ImageReader(buf), 72, 300, 468, 351)
+        c.showPage()
+    c.save()
+    return path
+
+
+def _make_scanned_pdf(path: str, pagesize=(612, 792)) -> str:
+    """An image-only page, like a scanner produces: no text layer at all."""
+    from PIL import Image, ImageDraw
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+
+    w, h = int(pagesize[0] * 100 / 72), int(pagesize[1] * 100 / 72)
+    img = Image.new("RGB", (w, h), "white")
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((w // 10, h // 10, w // 2, h // 6), fill=(90, 90, 90))
+    draw.rectangle((w // 10, h // 2, 3 * w // 4, h // 2 + 30), fill=(40, 40, 40))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    c = canvas.Canvas(path, pagesize=pagesize)
+    c.drawImage(ImageReader(buf), 0, 0, pagesize[0], pagesize[1])
+    c.showPage()
+    c.save()
+    return path
+
+
+def _make_radio_form_pdf(path: str) -> str:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+
+    c = canvas.Canvas(path, pagesize=letter)
+    c.drawString(72, 730, "T-shirt size:")
+    for i, size in enumerate(("S", "M", "L")):
+        c.acroForm.radio(
+            name="size", value=size, selected=False, x=170 + i * 40, y=725,
+            buttonStyle="circle", borderStyle="solid", shape="circle", forceBorder=True,
+        )
+    c.drawString(72, 690, "Quantity:")
+    c.acroForm.textfield(name="qty", x=170, y=684, width=80, height=18, forceBorder=True)
+    c.save()
+    return path
+
+
+def _make_xmp_pdf(src_path: str, path: str) -> str:
+    """A copy of ``src_path`` carrying an XMP packet that names its author."""
+    from pypdf import PdfWriter
+    from pypdf.generic import DecodedStreamObject, NameObject
+
+    writer = PdfWriter(clone_from=src_path)
+    xmp = DecodedStreamObject()
+    xmp.set_data(
+        b'<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+        b'<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF '
+        b'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        b'<rdf:Description xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        b"<dc:creator>Secret Xmp Author</dc:creator></rdf:Description>"
+        b'</rdf:RDF></x:xmpmeta><?xpacket end="w"?>'
+    )
+    xmp[NameObject("/Type")] = NameObject("/Metadata")
+    xmp[NameObject("/Subtype")] = NameObject("/XML")
+    writer._root_object[NameObject("/Metadata")] = writer._add_object(xmp)
+    with open(path, "wb") as fh:
+        writer.write(fh)
+    return path
+
+
+def _make_blank_pdf(path: str, pagesize=(612, 792)) -> str:
+    from reportlab.pdfgen import canvas
+
+    c = canvas.Canvas(path, pagesize=pagesize)
+    c.showPage()
+    c.save()
+    return path
+
+
+class FakeTesseract:
+    """A deterministic stand-in for pytesseract (no Tesseract binary needed).
+
+    ``image_to_data`` "recognises" three words at fixed fractions of whatever
+    image it is given, in render pixels, exactly like the real engine reports
+    them; the tests then check where they land on the PDF page.
+    """
+
+    WORDS = [
+        # text, left, top, width, height (fractions of the rendered image)
+        ("INVOICE", 0.10, 0.10, 0.25, 0.04),
+        ("TOTAL", 0.10, 0.50, 0.15, 0.03),
+        ("42.00", 0.60, 0.50, 0.12, 0.03),
+    ]
+
+    class Output:
+        DICT = "dict"
+
+    def __init__(self):
+        self.calls = []
+
+    def image_to_data(self, image, lang=None, config="", output_type=None):
+        self.calls.append(("data", image.size, lang, config))
+        width, height = image.size
+        data = {k: [] for k in ("level", "text", "left", "top", "width", "height", "conf")}
+        # Tesseract also reports structural rows (page, block, line) with conf -1.
+        rows = [(1, "", 0.0, 0.0, 1.0, 1.0, -1)]
+        rows += [(5, t, l, tp, w, h, 91) for t, l, tp, w, h in self.WORDS]
+        for level, text, l, tp, w, h, conf in rows:
+            data["level"].append(level)
+            data["text"].append(text)
+            data["left"].append(int(round(l * width)))
+            data["top"].append(int(round(tp * height)))
+            data["width"].append(int(round(w * width)))
+            data["height"].append(int(round(h * height)))
+            data["conf"].append(conf)
+        return data
+
+    def image_to_string(self, image, lang=None, config=""):
+        self.calls.append(("string", image.size, lang, config))
+        return " ".join(w[0] for w in self.WORDS)
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -206,6 +342,62 @@ def encrypted_pdf(fixtures_dir, text_pdf_b) -> str:
     return _make_encrypted_pdf(
         text_pdf_b, os.path.join(fixtures_dir, "encrypted.pdf"), "open123", "owner123"
     )
+
+
+@pytest.fixture(scope="session")
+def photo_pdf(fixtures_dir) -> str:
+    return _make_photo_pdf(os.path.join(fixtures_dir, "photos.pdf"))
+
+
+@pytest.fixture(scope="session")
+def scanned_pdf(fixtures_dir) -> str:
+    return _make_scanned_pdf(os.path.join(fixtures_dir, "scanned.pdf"))
+
+
+@pytest.fixture(scope="session")
+def radio_form_pdf(fixtures_dir) -> str:
+    return _make_radio_form_pdf(os.path.join(fixtures_dir, "radio_form.pdf"))
+
+
+@pytest.fixture(scope="session")
+def xmp_pdf(fixtures_dir, text_pdf) -> str:
+    return _make_xmp_pdf(text_pdf, os.path.join(fixtures_dir, "with_xmp.pdf"))
+
+
+@pytest.fixture(scope="session")
+def blank_pdf(fixtures_dir) -> str:
+    return _make_blank_pdf(os.path.join(fixtures_dir, "blank.pdf"))
+
+
+@pytest.fixture(scope="session")
+def not_a_pdf(fixtures_dir) -> str:
+    path = os.path.join(fixtures_dir, "notapdf.pdf")
+    with open(path, "wb") as fh:
+        fh.write(b"hello!")
+    return path
+
+
+@pytest.fixture
+def fake_tesseract(monkeypatch):
+    """Patch the OCR engine seam with :class:`FakeTesseract`."""
+    import importlib
+
+    ocr_mod = importlib.import_module("pdftools.ocr")
+    fake = FakeTesseract()
+    monkeypatch.setattr(ocr_mod, "_configure_tesseract", lambda: fake)
+    return fake
+
+
+@pytest.fixture
+def work_dir(tmp_path, text_pdf, text_pdf_b, not_a_pdf) -> str:
+    """A private folder of inputs for batch tests (keeps fixtures_dir clean)."""
+    import shutil
+
+    d = os.path.join(str(tmp_path), "work")
+    os.makedirs(d)
+    shutil.copy(text_pdf, os.path.join(d, "doc5.pdf"))
+    shutil.copy(text_pdf_b, os.path.join(d, "doc3.pdf"))
+    return d
 
 
 @pytest.fixture

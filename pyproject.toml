@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pdf-power-tools"
-version = "0.3.0"
+version = "0.4.0"
 description = "One CLI and library for everything PDF: merge, split, compress, watermark, encrypt, extract text/tables/images, fill forms and OCR."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -22,6 +22,8 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Utilities",
     "Topic :: Office/Business",
 ]
