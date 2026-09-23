@@ -1,15 +1,21 @@
 """Internal helpers shared across the operation modules.
 
 Nothing here is part of the public API — import from the top-level package or
-the ``ops_*`` modules instead. These are the small, boring pieces (page-range
-parsing, input globbing, colour parsing) that every operation reuses.
+the ``ops_*`` modules instead. These are the small, boring pieces (opening
+documents safely, page-range parsing, input globbing, colour parsing) that
+every operation reuses.
 """
 
 from __future__ import annotations
 
+import contextlib
 import glob as _glob
 import os
-from typing import Iterable, List, Sequence, Tuple
+import re
+from typing import TYPE_CHECKING, Iterable, List, Optional, Sequence, Tuple
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from pypdf import PdfReader, PdfWriter
 
 
 class PdfToolsError(Exception):
@@ -19,6 +25,168 @@ class PdfToolsError(Exception):
     message should read like something a person wants to see.
     """
 
+
+class PdfToolsWarning(UserWarning):
+    """Emitted for recoverable problems the caller should hear about.
+
+    Examples: a form key that matches no field, or a compression mode that is
+    about to throw away selectable text. The CLI prints these as
+    ``warning: ...`` lines; library callers can filter or escalate them with
+    the standard :mod:`warnings` machinery.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Opening documents. One place turns "missing / not a PDF / damaged /
+# password-protected" into a clean PdfToolsError for every backend.
+# ---------------------------------------------------------------------------
+
+def _locked_message(path: str) -> str:
+    return (
+        f"{path!r} is password-protected. Pass --password with the user or "
+        "owner password (library: password=...)."
+    )
+
+
+def _require_file(path) -> str:
+    if not isinstance(path, (str, os.PathLike)):
+        raise PdfToolsError(f"Expected a file path, got {type(path).__name__}.")
+    name = os.fspath(path)
+    if not os.path.exists(name):
+        raise PdfToolsError(f"Input not found: {name!r}")
+    if not os.path.isfile(name):
+        raise PdfToolsError(f"Not a file: {name!r}")
+    return name
+
+
+def _describe(exc: BaseException) -> str:
+    detail = str(exc).strip() or exc.__class__.__name__
+    return detail.splitlines()[0]
+
+
+def open_reader(path: str, password: Optional[str] = None) -> "PdfReader":
+    """Open ``path`` with pypdf and return a ready-to-use, decrypted reader.
+
+    * Missing files, directories, non-PDFs and damaged files raise
+      :class:`PdfToolsError` with a one-line explanation.
+    * Encrypted files are decrypted with ``password``. Without a password the
+      empty user password is tried automatically, which is how
+      "owner-password only" files open in every viewer.
+    * A locked file without the right password raises a PdfToolsError that
+      names ``--password``.
+    """
+    from pypdf import PdfReader
+
+    name = _require_file(path)
+    try:
+        reader = PdfReader(name)
+    except Exception as exc:  # pypdf raises a zoo of types on bad input
+        raise PdfToolsError(
+            f"Could not read {name!r}: not a PDF, or the file is damaged "
+            f"({_describe(exc)})."
+        ) from exc
+
+    if reader.is_encrypted:
+        try:
+            result = reader.decrypt(password if password is not None else "")
+        except Exception as exc:  # e.g. missing crypto backend for AES
+            raise PdfToolsError(f"Could not decrypt {name!r}: {_describe(exc)}") from exc
+        if not result:
+            if password:
+                raise PdfToolsError(f"Wrong password for {name!r}.")
+            raise PdfToolsError(_locked_message(name))
+
+    try:
+        len(reader.pages)  # parse the page tree now, not halfway through an op
+    except Exception as exc:
+        raise PdfToolsError(
+            f"Could not read {name!r}: the page tree is damaged ({_describe(exc)})."
+        ) from exc
+    return reader
+
+
+def open_writer(path: str, password: Optional[str] = None) -> "PdfWriter":
+    """Clone ``path`` into a :class:`pypdf.PdfWriter`, forms and outline included.
+
+    The clone comes from a decrypted reader, so the result is written
+    unencrypted — run ``encrypt`` again if the output must stay locked.
+    """
+    from pypdf import PdfWriter
+
+    return PdfWriter(clone_from=open_reader(path, password))
+
+
+def open_pdfium(path: str, password: Optional[str] = None):
+    """Open ``path`` with pypdfium2, mapping failures to PdfToolsError.
+
+    The caller owns the returned document and must ``close()`` it.
+    """
+    import pypdfium2 as pdfium
+
+    name = _require_file(path)
+    try:
+        return pdfium.PdfDocument(name, password=password or None)
+    except pdfium.PdfiumError as exc:
+        if "password" in str(exc).lower():
+            if password:
+                raise PdfToolsError(f"Wrong password for {name!r}.") from exc
+            raise PdfToolsError(_locked_message(name)) from exc
+        raise PdfToolsError(
+            f"Could not read {name!r}: not a PDF, or the file is damaged "
+            f"({_describe(exc)})."
+        ) from exc
+
+
+def open_plumber(path: str, password: Optional[str] = None):
+    """Open ``path`` with pdfplumber, mapping failures to PdfToolsError.
+
+    The caller owns the returned document (use it as a context manager).
+    """
+    import pdfplumber
+
+    name = _require_file(path)
+    try:
+        pdf = pdfplumber.open(name, password=password or "")
+        len(pdf.pages)
+        return pdf
+    except Exception as exc:
+        # pdfminer reports a bad password as an empty exception, so let pypdf
+        # (which knows the difference) phrase the error when it can.
+        open_reader(name, password)
+        raise PdfToolsError(
+            f"Could not read {name!r} for layout analysis ({_describe(exc)})."
+        ) from exc
+
+
+@contextlib.contextmanager
+def binary_streams():
+    """Make reportlab write raw binary streams instead of ASCII85 text.
+
+    reportlab ASCII85-encodes every stream by default, which inflates
+    embedded JPEGs and page images by 25% for no benefit in a binary file.
+    The setting is global in reportlab, so it is restored on exit.
+    """
+    from reportlab import rl_config
+
+    previous = rl_config.useA85
+    rl_config.useA85 = 0
+    try:
+        yield
+    finally:
+        rl_config.useA85 = previous
+
+
+def write_pdf(writer: "PdfWriter", output: str) -> str:
+    """Write ``writer`` to ``output`` (creating parent dirs); return the path."""
+    ensure_parent_dir(output)
+    with open(output, "wb") as fh:
+        writer.write(fh)
+    return output
+
+
+# ---------------------------------------------------------------------------
+# Page ranges
+# ---------------------------------------------------------------------------
 
 def parse_page_ranges(spec: str, page_count: int) -> List[int]:
     """Turn a human range spec into a list of 0-based page indices.
@@ -88,20 +256,48 @@ def _push_index(indices: List[int], one_based: int, page_count: int, spec: str) 
     indices.append(one_based - 1)
 
 
+# ---------------------------------------------------------------------------
+# Inputs and outputs
+# ---------------------------------------------------------------------------
+
+_GLOB_CHARS = re.compile(r"[*?\[]")
+
+
+def is_glob(pattern: str) -> bool:
+    """True when ``pattern`` will be expanded as a glob, not used literally."""
+    return bool(_GLOB_CHARS.search(pattern)) and not os.path.isfile(pattern)
+
+
+def natural_key(text: str) -> list:
+    """Sort key that orders embedded numbers numerically.
+
+    ``scan2.pdf`` sorts before ``scan10.pdf`` — what a person expects when
+    merging numbered scans, and what plain string sorting gets wrong.
+    """
+    parts = re.split(r"(\d+)", text)
+    return [int(p) if p.isdigit() else p.casefold() for p in parts]
+
+
 def expand_inputs(patterns: Sequence[str]) -> List[str]:
     """Expand a list of paths and globs into concrete, existing file paths.
 
     A literal path that exists is kept as-is (so filenames containing glob
     characters still work). Anything else is treated as a glob. Order between
-    patterns is preserved; matches inside one glob are sorted for determinism.
+    patterns is preserved; matches inside one glob are sorted in natural
+    (human) order, so ``scan2`` comes before ``scan10``.
     """
     out: List[str] = []
     seen = set()
     for pattern in patterns:
         if os.path.isfile(pattern):
             matches = [pattern]
+        elif not _GLOB_CHARS.search(pattern):
+            raise PdfToolsError(f"Input not found: {pattern!r}")
         else:
-            matches = sorted(_glob.glob(pattern, recursive=True))
+            matches = sorted(
+                (m for m in _glob.glob(pattern, recursive=True) if os.path.isfile(m)),
+                key=natural_key,
+            )
         if not matches:
             raise PdfToolsError(f"No files matched: {pattern!r}")
         for match in matches:

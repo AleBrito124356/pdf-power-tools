@@ -1,7 +1,11 @@
 """Page-level operations: merge, split, rotate, delete, reorder, n-up.
 
-These never touch page content — they move whole pages around. Text, images
-and form fields ride along untouched.
+These never touch page content — they move whole pages around. Text, images,
+links, form fields and bookmarks ride along: documents are cloned or appended
+with pypdf's structure-aware APIs instead of being rebuilt page by page.
+
+Every function accepts ``password=`` for encrypted inputs; outputs are
+written unencrypted.
 """
 
 from __future__ import annotations
@@ -14,9 +18,10 @@ from pypdf import PdfReader, PdfWriter, Transformation
 from ._util import (
     PdfToolsError,
     default_output,
-    ensure_parent_dir,
     expand_inputs,
+    open_reader,
     parse_page_ranges,
+    write_pdf,
 )
 
 
@@ -29,15 +34,21 @@ def merge(
     output: str,
     *,
     bookmark_per_source: bool = True,
+    password: Optional[str] = None,
 ) -> str:
     """Concatenate PDFs in order into ``output``.
 
     ``inputs`` may contain literal paths and glob patterns; they are expanded
-    and de-duplicated while preserving order. When ``bookmark_per_source`` is
-    true, a top-level outline entry is added at the first page of every source
-    so the merged file stays navigable.
+    (globs in natural order, so ``scan2`` precedes ``scan10``) and
+    de-duplicated while preserving order.
 
-    Returns the output path.
+    Sources are appended structurally: interactive form fields, internal
+    links and each source's own bookmarks survive. When
+    ``bookmark_per_source`` is true, every source gets a top-level bookmark
+    named after its file with its original bookmarks nested beneath it;
+    otherwise the original bookmarks stay at the top level.
+
+    ``password`` is tried on every encrypted input. Returns the output path.
     """
     files = expand_inputs(list(inputs))
     if len(files) < 1:
@@ -45,27 +56,27 @@ def merge(
 
     writer = PdfWriter()
     for path in files:
-        reader = PdfReader(path)
-        start_index = len(writer.pages)
-        for page in reader.pages:
-            writer.add_page(page)
-        if bookmark_per_source and len(reader.pages) > 0:
-            writer.add_outline_item(_bookmark_title(path), start_index)
-
-    ensure_parent_dir(output)
-    with open(output, "wb") as fh:
-        writer.write(fh)
-    return output
+        reader = open_reader(path, password)
+        if len(reader.pages) == 0:
+            continue
+        writer.append(
+            reader,
+            outline_item=_bookmark_title(path) if bookmark_per_source else None,
+        )
+    return write_pdf(writer, output)
 
 
 def _write_indices(reader: PdfReader, indices: Sequence[int], output: str) -> str:
     writer = PdfWriter()
-    for idx in indices:
-        writer.add_page(reader.pages[idx])
-    ensure_parent_dir(output)
-    with open(output, "wb") as fh:
-        writer.write(fh)
-    return output
+    if len(set(indices)) == len(indices):
+        # Structure-aware copy: keeps form fields, links and the bookmarks
+        # that point at the pages being kept.
+        writer.append(reader, pages=list(indices))
+    else:
+        # Repeated pages (e.g. reorder "1,1,2") need plain page copies.
+        for idx in indices:
+            writer.add_page(reader.pages[idx])
+    return write_pdf(writer, output)
 
 
 def split(
@@ -75,10 +86,12 @@ def split(
     ranges: Optional[str] = None,
     every_n: Optional[int] = None,
     by_bookmark: bool = False,
+    password: Optional[str] = None,
 ) -> List[str]:
     """Split one PDF into several. Choose exactly one mode.
 
-    * ``ranges="1-3,7,9-"`` — each comma group becomes its own file.
+    * ``ranges="1-3,7,9-"`` — each comma group becomes its own file (to keep
+      several groups in *one* file, use :func:`reorder`).
     * ``every_n=5`` — fixed-size chunks of N pages.
     * ``by_bookmark=True`` — a file per top-level outline entry, cut at each
       bookmark's page.
@@ -92,7 +105,7 @@ def split(
             "split needs exactly one of: ranges, every_n, by_bookmark."
         )
 
-    reader = PdfReader(input_path)
+    reader = open_reader(input_path, password)
     total = len(reader.pages)
     stem = os.path.splitext(os.path.basename(input_path))[0]
     os.makedirs(output_dir, exist_ok=True)
@@ -160,27 +173,23 @@ def rotate(
     *,
     pages: Optional[str] = None,
     angle: int = 90,
+    password: Optional[str] = None,
 ) -> str:
     """Rotate pages clockwise by a multiple of 90 degrees.
 
-    ``pages`` is a range spec (``"1-3,7"``); ``None`` rotates every page.
+    ``pages`` is a range spec (``"1-3,7"``); ``None`` rotates every page. The
+    document is cloned, so forms, links and bookmarks are untouched.
     """
     if angle % 90 != 0:
         raise PdfToolsError("Rotation angle must be a multiple of 90.")
-    reader = PdfReader(input_path)
-    total = len(reader.pages)
+    writer = PdfWriter(clone_from=open_reader(input_path, password))
+    total = len(writer.pages)
     target = set(parse_page_ranges(pages, total)) if pages else set(range(total))
     output = output or default_output(input_path, "rotated")
 
-    writer = PdfWriter()
-    for idx, page in enumerate(reader.pages):
-        if idx in target:
-            page.rotate(angle)
-        writer.add_page(page)
-    ensure_parent_dir(output)
-    with open(output, "wb") as fh:
-        writer.write(fh)
-    return output
+    for idx in sorted(target):
+        writer.pages[idx].rotate(angle)
+    return write_pdf(writer, output)
 
 
 def delete_pages(
@@ -188,9 +197,10 @@ def delete_pages(
     output: Optional[str] = None,
     *,
     pages: str,
+    password: Optional[str] = None,
 ) -> str:
     """Drop the pages named by the ``pages`` spec; keep the rest in order."""
-    reader = PdfReader(input_path)
+    reader = open_reader(input_path, password)
     total = len(reader.pages)
     drop = set(parse_page_ranges(pages, total))
     keep = [i for i in range(total) if i not in drop]
@@ -205,13 +215,16 @@ def reorder(
     output: Optional[str] = None,
     *,
     order: str,
+    password: Optional[str] = None,
 ) -> str:
     """Rebuild the document in the page order given by ``order``.
 
     ``order`` is a range spec whose sequence is respected literally, so
     ``"3,1,2"`` really moves page 3 to the front and duplicates are allowed.
+    It doubles as "keep only these pages": ``order="1-3,7"`` writes one file
+    holding pages 1, 2, 3 and 7.
     """
-    reader = PdfReader(input_path)
+    reader = open_reader(input_path, password)
     total = len(reader.pages)
     indices = parse_page_ranges(order, total)
     output = output or default_output(input_path, "reordered")
@@ -223,18 +236,19 @@ def n_up(
     output: Optional[str] = None,
     *,
     n: int = 2,
+    password: Optional[str] = None,
 ) -> str:
     """Impose 2 or 4 source pages onto each output sheet.
 
     2-up rotates the sheet to landscape and places pages side by side; 4-up
     keeps the orientation and tiles a 2x2 grid. Pages are scaled to fit their
-    cell while preserving aspect ratio and centred within it. The imposed
-    pages are flattened graphics — text is no longer selectable, which is the
-    expected trade for a print-ready handout.
+    cell while preserving aspect ratio and centred within it. Source content
+    is embedded as vector graphics, so text stays selectable and searchable;
+    interactive form fields are not carried onto the handout sheets.
     """
     if n not in (2, 4):
         raise PdfToolsError("n_up supports n=2 or n=4.")
-    reader = PdfReader(input_path)
+    reader = open_reader(input_path, password)
     if len(reader.pages) == 0:
         raise PdfToolsError("Document has no pages.")
     first = reader.pages[0]
@@ -271,7 +285,4 @@ def n_up(
             transform = Transformation().scale(scale, scale).translate(tx, ty)
             sheet.merge_transformed_page(page, transform)
 
-    ensure_parent_dir(output)
-    with open(output, "wb") as fh:
-        writer.write(fh)
-    return output
+    return write_pdf(writer, output)
